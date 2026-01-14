@@ -1,58 +1,91 @@
-'use client';
+import React, { createContext, useContext, useEffect, useState, ReactNode } from 'react';
+import { neon } from '../lib/neon';
+import { Profile, UserRole, AuthSession, AuthUser, AuthChangeEvent } from '../types';
 
-import { createContext, useContext, useEffect, useState } from 'react';
-import { supabase } from '@/lib/supabase';
-import { UserProfile } from '@/types';
-
-type AuthContextType = {
-  user: UserProfile | null;
+interface AuthContextType {
+  session: AuthSession | null;
+  user: AuthUser | null;
+  profile: Profile | null;
   loading: boolean;
-  signIn: (email: string, password: string) => Promise<{ error: any; data: any }>;
-  signUp: (email: string, password: string, name: string, countryId: number) => Promise<{ error: any; data: any }>;
+  isAdmin: boolean;
+  isFacilityOwner: boolean;
   signOut: () => Promise<void>;
-};
+  refreshProfile: () => Promise<void>;
+}
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
 
-export function AuthProvider({ children }: { children: React.ReactNode }) {
-  const [user, setUser] = useState<UserProfile | null>(null);
+export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) => {
+  const [session, setSession] = useState<AuthSession | null>(null);
+  const [user, setUser] = useState<AuthUser | null>(null);
+  const [profile, setProfile] = useState<Profile | null>(null);
   const [loading, setLoading] = useState(true);
 
-  useEffect(() => {
-    const fetchUser = async () => {
-      const { data: { session } } = await supabase.auth.getSession();
-      
-      if (session?.user) {
-        const { data, error } = await supabase
-          .from('users')
-          .select('*')
-          .eq('id', session.user.id)
-          .single();
-        
-        if (data && !error) {
-          setUser(data as UserProfile);
+  const fetchProfile = async (userId: string) => {
+    try {
+      // Try multiple times with increasing delays
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        // Explicitly select columns to avoid issues if 'profiles' is a view with broken underlying columns
+        const { data: profileData, error } = await neon
+          .from('profiles')
+          .select('id, email, name, phone, role, country_id, language, is_active, created_at, updated_at')
+          .eq('id', userId)
+          .maybeSingle();
+
+        if (error) {
+          console.warn(`Attempt ${attempt}: Error fetching profile:`, error);
+          if (attempt < 3) {
+            await new Promise(resolve => setTimeout(resolve, attempt * 1000));
+            continue;
+          }
+          throw error;
+        }
+
+        if (profileData) {
+          setProfile(profileData as Profile);
+          return;
+        }
+
+        if (attempt < 3) {
+          console.log(`Attempt ${attempt}: Profile not found, retrying...`);
+          await new Promise(resolve => setTimeout(resolve, attempt * 1000));
         }
       }
-      
+
+      console.warn('Could not find user profile after multiple attempts');
+      setProfile(null);
+    } catch (error) {
+      console.error('Error fetching user:', error);
+      setProfile(null);
+    }
+  };
+
+  useEffect(() => {
+    // Get initial session
+    const initSession = async () => {
+      const { data, error } = await neon.auth.getSession();
+      const session = data?.session ?? null;
+      setSession(session);
+      setUser(session?.user ?? null);
+      if (session?.user) {
+        await fetchProfile(session.user.id);
+      }
       setLoading(false);
     };
 
-    fetchUser();
+    initSession();
 
-    const { data: { subscription } } = supabase.auth.onAuthStateChange(async (event, session) => {
-      if (event === 'SIGNED_IN' && session) {
-        const { data, error } = await supabase
-          .from('users')
-          .select('*')
-          .eq('id', session.user.id)
-          .single();
-        
-        if (data && !error) {
-          setUser(data as UserProfile);
-        }
-      } else if (event === 'SIGNED_OUT') {
-        setUser(null);
+    // Listen for auth changes
+    const { data: { subscription } } = neon.auth.onAuthStateChange((_event: string, session: AuthSession | null) => {
+      setSession(session);
+      setUser(session?.user ?? null);
+
+      if (session?.user) {
+        fetchProfile(session.user.id);
+      } else {
+        setProfile(null);
       }
+      setLoading(false);
     });
 
     return () => {
@@ -60,87 +93,37 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     };
   }, []);
 
-  const signIn = async (email: string, password: string) => {
-    setLoading(true);
-    const response = await supabase.auth.signInWithPassword({ email, password });
-    
-    if (response.data.session) {
-      const { data, error } = await supabase
-        .from('users')
-        .select('*')
-        .eq('id', response.data.user?.id)
-        .single();
-      
-      if (data && !error) {
-        setUser(data as UserProfile);
-      }
-    }
-    
-    setLoading(false);
-    return response;
-  };
-
-  const signUp = async (email: string, password: string, name: string, countryId: number) => {
-    setLoading(true);
-    
-    const response = await supabase.auth.signUp({
-      email,
-      password,
-      options: {
-        data: {
-          name,
-          country_id: countryId
-        }
-      }
-    });
-    
-    if (response.data.user) {
-      // Create user profile in users table
-      const { error } = await supabase.from('users').insert({
-        id: response.data.user.id,
-        email,
-        name,
-        country_id: countryId,
-        role: 'user',
-        is_active: true,
-        created_at: new Date().toISOString()
-      });
-      
-      if (!error) {
-        // Fetch the country code for redirection
-        const { data: countryData } = await supabase
-          .from('countries')
-          .select('code')
-          .eq('id', countryId)
-          .single();
-        
-        if (countryData) {
-          // We'll handle redirection in the signup component
-          console.log(`User should be redirected to /${countryData.code.toLowerCase()}`);
-        }
-      }
-    }
-    
-    setLoading(false);
-    return response;
-  };
-
   const signOut = async () => {
-    await supabase.auth.signOut();
+    await neon.auth.signOut();
+    setProfile(null);
+    setSession(null);
     setUser(null);
   };
 
-  return (
-    <AuthContext.Provider value={{ user, loading, signIn, signUp, signOut }}>
-      {children}
-    </AuthContext.Provider>
-  );
-}
+  const refreshProfile = async () => {
+    if (user) {
+      await fetchProfile(user.id);
+    }
+  };
 
-export function useAuth() {
+  const value = {
+    session,
+    user,
+    profile,
+    loading,
+    isAdmin: profile?.role === UserRole.ADMIN || profile?.role === UserRole.SUPER_ADMIN,
+    isFacilityOwner: profile?.role === UserRole.FACILITY_OWNER,
+    signOut,
+    refreshProfile
+  };
+
+  return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
+};
+
+export const useAuth = () => {
   const context = useContext(AuthContext);
   if (context === undefined) {
     throw new Error('useAuth must be used within an AuthProvider');
   }
   return context;
-}
+};
